@@ -1,29 +1,44 @@
 #!/bin/bash
 
 # エラーが発生した場合にスクリプトを終了
-set -e
+set -euo pipefail
+
+# ユーティリティスクリプトの読み込み
+source ./utils.sh
 
 # 環境変数ファイルを読み込む
 ENV_FILE="$HOME/.obp_env"
 if [ -f "$ENV_FILE" ]; then
     source "$ENV_FILE"
 else
-    echo "エラー: 環境変数ファイル $ENV_FILE が見つかりません。create_sa.sh を実行してください。"
-    exit 1
+    handle_error 1 "Environment variable file $ENV_FILE not found. Please run create_sa.sh first."
 fi
 
 # デフォルト値の設定
-DEFAULT_REGION="asia-northeast1"
-DEFAULT_MACHINE_TYPE="e2-medium"
-SA_KEY_FILE="obp-deployment-sa-key.json"
-
-# 変数の初期化
-REGION=$DEFAULT_REGION
-MACHINE_TYPE=$DEFAULT_MACHINE_TYPE
+PROJECT_ID=""
+VPC_NAME=""
+SUBNET_NAME=""
+REGION=""
+MACHINE_TYPE="e2-medium"
+INSTANCE_NAME="obp-master-vm"
+SERVICE_ACCOUNT_EMAIL=""
+SA_KEY_FILE="sa-key.json"
 
 # 引数の処理
 while [[ $# -gt 0 ]]; do
   case $1 in
+    --project-id=*)
+      PROJECT_ID="${1#*=}"
+      shift
+      ;;
+    --vpc-name=*)
+      VPC_NAME="${1#*=}"
+      shift
+      ;;
+    --subnet-name=*)
+      SUBNET_NAME="${1#*=}"
+      shift
+      ;;
     --region=*)
       REGION="${1#*=}"
       shift
@@ -32,63 +47,59 @@ while [[ $# -gt 0 ]]; do
       MACHINE_TYPE="${1#*=}"
       shift
       ;;
+    --service-account-email=*)
+      SERVICE_ACCOUNT_EMAIL="${1#*=}"
+      shift
+      ;;
     --sa-key-file=*)
       SA_KEY_FILE="${1#*=}"
       shift
       ;;
     *)
-      echo "エラー: 不明な引数 $1"
-      echo "使用方法: $0 [--region=REGION] [--machine-type=MACHINE_TYPE] [--sa-key-file=FILE]"
-      exit 1
+      handle_error 1 "Unknown argument: $1"
       ;;
   esac
 done
 
-# VMインスタンス名を設定
-INSTANCE_NAME="obp-master-vm"
+# 必須パラメータの確認
+validate_env_vars "PROJECT_ID" "VPC_NAME" "SUBNET_NAME" "REGION" "SERVICE_ACCOUNT_EMAIL"
 
-# サービスアカウントキーファイルの存在確認
-if [ ! -f "$SA_KEY_FILE" ]; then
-    echo "エラー: サービスアカウントキーファイル $SA_KEY_FILE が見つかりません。"
-    exit 1
-fi
+log $LOG_LEVEL_INFO "Project ID: $PROJECT_ID"
+log $LOG_LEVEL_INFO "VPC Name: $VPC_NAME"
+log $LOG_LEVEL_INFO "Subnet Name: $SUBNET_NAME"
+log $LOG_LEVEL_INFO "Region: $REGION"
+log $LOG_LEVEL_INFO "Machine Type: $MACHINE_TYPE"
+log $LOG_LEVEL_INFO "Service Account Email: $SERVICE_ACCOUNT_EMAIL"
 
 # インスタンスの存在確認
-INSTANCE_EXISTS=$(gcloud compute instances list --filter="name=$INSTANCE_NAME" --format="value(name)")
-
-if [ -z "$INSTANCE_EXISTS" ]; then
-  echo "インスタンス $INSTANCE_NAME が存在しません。新規作成します。"
-  /bin/bash create_vm_instance.sh --region="$REGION" --machine-type="$MACHINE_TYPE" --sa-key-file="$SA_KEY_FILE"
+if check_resource_exists "compute instances" "$INSTANCE_NAME" "$PROJECT_ID" "--zone=${REGION}-b"; then
+    log $LOG_LEVEL_INFO "Instance $INSTANCE_NAME found."
+    
+    # インスタンスの状態を確認
+    INSTANCE_STATUS=$(gcloud compute instances describe $INSTANCE_NAME --project=$PROJECT_ID --zone=${REGION}-b --format="value(status)")
+    
+    if [ "$INSTANCE_STATUS" = "RUNNING" ]; then
+        log $LOG_LEVEL_INFO "Instance $INSTANCE_NAME is already running."
+    elif [ "$INSTANCE_STATUS" = "TERMINATED" ]; then
+        log $LOG_LEVEL_INFO "Starting instance $INSTANCE_NAME."
+        gcloud compute instances start $INSTANCE_NAME --project=$PROJECT_ID --zone=${REGION}-b
+        log $LOG_LEVEL_INFO "Instance $INSTANCE_NAME has been started."
+    else
+        log $LOG_LEVEL_WARN "Instance $INSTANCE_NAME is in state: $INSTANCE_STATUS"
+        log $LOG_LEVEL_WARN "Please check the instance state and handle manually if necessary."
+    fi
 else
-  # インスタンスの状態を確認
-  INSTANCE_STATUS=$(gcloud compute instances describe $INSTANCE_NAME --zone=${REGION}-b --format="value(status)")
-  
-  if [ "$INSTANCE_STATUS" = "TERMINATED" ]; then
-    echo "インスタンス $INSTANCE_NAME は停止しています。起動します。"
-    gcloud compute instances start $INSTANCE_NAME --zone=${REGION}-b
-  elif [ "$INSTANCE_STATUS" = "RUNNING" ]; then
-    echo "インスタンス $INSTANCE_NAME は既に起動しています。"
-  else
-    echo "インスタンス $INSTANCE_NAME の状態: $INSTANCE_STATUS"
-    exit 1
-  fi
-
-  # インスタンスが完全に起動し、SSHが利用可能になるまで待機
-  echo "インスタンスの起動とSSHの準備を待っています..."
-  while ! gcloud compute ssh $INSTANCE_NAME --zone=${REGION}-b --command="echo SSH is ready" &>/dev/null; do
-    echo "SSHの準備中..."
-    sleep 10
-  done
-  echo "SSHが利用可能になりました。"
-
-  # サービスアカウントキーファイルの転送
-  echo "サービスアカウントキーファイルを転送しています..."
-  gcloud compute scp $SA_KEY_FILE $INSTANCE_NAME:~/obp-deployment-sa-key.json --zone=${REGION}-b
-
-  # キーファイルの権限を設定
-  gcloud compute ssh $INSTANCE_NAME --zone=${REGION}-b --command="chmod 600 ~/obp-deployment-sa-key.json"
-
-  echo "サービスアカウントキーファイルが転送され、権限が設定されました。"
+    log $LOG_LEVEL_INFO "Instance $INSTANCE_NAME not found. Creating a new instance."
+    
+    # create_vm_instance.sh スクリプトを呼び出す
+    ./create_vm_instance.sh \
+        --project-id=$PROJECT_ID \
+        --vpc-name=$VPC_NAME \
+        --subnet-name=$SUBNET_NAME \
+        --region=$REGION \
+        --machine-type=$MACHINE_TYPE \
+        --service-account-email=$SERVICE_ACCOUNT_EMAIL \
+        --sa-key-file=$SA_KEY_FILE
 fi
 
-echo "インスタンス $INSTANCE_NAME の操作が完了しました。"
+log $LOG_LEVEL_INFO "Operation completed."

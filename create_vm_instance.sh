@@ -1,31 +1,46 @@
 #!/bin/bash
 
 # エラーが発生した場合にスクリプトを終了
-set -e
+set -euo pipefail
+
+# ユーティリティスクリプトの読み込み
+source ./utils.sh
 
 # 環境変数ファイルを読み込む
 ENV_FILE="$HOME/.obp_env"
 if [ -f "$ENV_FILE" ]; then
     source "$ENV_FILE"
 else
-    echo "エラー: 環境変数ファイル $ENV_FILE が見つかりません。create_sa.sh を実行してください。"
-    exit 1
+    handle_error 1 "Environment variable file $ENV_FILE not found. Please run create_sa.sh first."
 fi
 
 # デフォルト値の設定
-DEFAULT_REGION="asia-northeast1"
-DEFAULT_MACHINE_TYPE="e2-medium"
+PROJECT_ID=""
+VPC_NAME=""
+SUBNET_NAME=""
+REGION=""
+MACHINE_TYPE="e2-medium"
+INSTANCE_NAME="obp-master-vm"
+SERVICE_ACCOUNT_EMAIL=""
 BOOT_DISK_SIZE="10GB"
 DATA_DISK_SIZE="200GB"
-SA_KEY_FILE="obp-deployment-sa-key.json"
-
-# 変数の初期化
-REGION=$DEFAULT_REGION
-MACHINE_TYPE=$DEFAULT_MACHINE_TYPE
+SA_KEY_FILE="sa-key.json"
 
 # 引数の処理
 while [[ $# -gt 0 ]]; do
   case $1 in
+    --project-id=*)
+      PROJECT_ID="${1#*=}"
+      shift
+      ;;
+    --vpc-name=*)
+      VPC_NAME="${1#*=}"
+      shift
+      ;;
+    --subnet-name=*)
+      SUBNET_NAME="${1#*=}"
+      shift
+      ;;
     --region=*)
       REGION="${1#*=}"
       shift
@@ -34,30 +49,39 @@ while [[ $# -gt 0 ]]; do
       MACHINE_TYPE="${1#*=}"
       shift
       ;;
+    --service-account-email=*)
+      SERVICE_ACCOUNT_EMAIL="${1#*=}"
+      shift
+      ;;
     --sa-key-file=*)
       SA_KEY_FILE="${1#*=}"
       shift
       ;;
     *)
-      echo "エラー: 不明な引数 $1"
-      echo "使用方法: $0 [--region=REGION] [--machine-type=MACHINE_TYPE] [--sa-key-file=FILE]"
-      exit 1
+      handle_error 1 "Unknown argument: $1"
       ;;
   esac
 done
 
-# VMインスタンス名を設定
-INSTANCE_NAME="obp-master-vm"
-
-# 特定のUbuntu 20.04 LTS イメージを設定
-UBUNTU_IMAGE_PROJECT="ubuntu-os-cloud"
-UBUNTU_IMAGE="ubuntu-2004-focal-v20240731"
+# 必須パラメータの確認
+validate_env_vars "PROJECT_ID" "VPC_NAME" "SUBNET_NAME" "REGION" "SERVICE_ACCOUNT_EMAIL"
 
 # サービスアカウントキーファイルの存在確認
 if [ ! -f "$SA_KEY_FILE" ]; then
-    echo "エラー: サービスアカウントキーファイル $SA_KEY_FILE が見つかりません。"
-    exit 1
+    handle_error 1 "Service account key file $SA_KEY_FILE not found."
 fi
+
+log $LOG_LEVEL_INFO "Project ID: $PROJECT_ID"
+log $LOG_LEVEL_INFO "VPC Name: $VPC_NAME"
+log $LOG_LEVEL_INFO "Subnet Name: $SUBNET_NAME"
+log $LOG_LEVEL_INFO "Region: $REGION"
+log $LOG_LEVEL_INFO "Machine Type: $MACHINE_TYPE"
+log $LOG_LEVEL_INFO "Service Account Email: $SERVICE_ACCOUNT_EMAIL"
+
+# 利用可能なゾーンのリストを取得
+ZONES=$(gcloud compute zones list --filter="region:($REGION)" --format="value(name)")
+ZONE=$(echo "$ZONES" | shuf -n 1)
+log $LOG_LEVEL_INFO "Selected Zone: $ZONE"
 
 # スタートアップスクリプトの作成
 cat << EOF > startup-script.sh
@@ -81,7 +105,7 @@ else
     echo "Data disk already mounted."
 fi
 
-# Dockerのインストール（初回のみ）
+# Dockerのインストール
 if ! command -v docker &> /dev/null; then
     echo "Installing Docker..."
     sudo apt-get update
@@ -90,117 +114,93 @@ if ! command -v docker &> /dev/null; then
     sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu \$(lsb_release -cs) stable"
     sudo apt-get update
     sudo apt-get install -y docker-ce docker-ce-cli containerd.io
-
-    # Dockerサービスの起動と有効化
-    echo "Starting and enabling Docker service..."
+    
+    # Dockerデータディレクトリの設定
+    sudo mkdir -p \$MOUNT_POINT/docker
+    sudo tee /etc/docker/daemon.json > /dev/null <<EOT
+{
+    "data-root": "\$MOUNT_POINT/docker"
+}
+EOT
     sudo systemctl start docker
     sudo systemctl enable docker
-
-    # 現在のユーザーをdockerグループに追加
-    echo "Adding current user to docker group..."
     sudo usermod -aG docker \$USER
-
-    # Dockerソケットのパーミッション変更
-    echo "Changing Docker socket permissions..."
     sudo chmod 666 /var/run/docker.sock
 else
     echo "Docker is already installed."
 fi
 
-# サンプルDockerコンテナの起動（例：Nginx）
-if ! docker ps -a | grep -q my-nginx; then
-    echo "Starting sample Nginx Docker container..."
-    docker run -d -p 80:80 --name my-nginx nginx
-else
-    echo "Nginx container is already running."
-fi
-
-# シリアルポートの有効化
-if ! grep -q "console=ttyS0" /etc/default/grub; then
-    echo "Enabling serial port..."
-    sudo sed -i 's/GRUB_CMDLINE_LINUX=""/GRUB_CMDLINE_LINUX="console=ttyS0,38400n8"/' /etc/default/grub
-    sudo update-grub
-else
-    echo "Serial port is already enabled."
-fi
-
-# tiffファイルの保存先ディレクトリの作成
-DEM_DIR="/mnt/disks/data/dem"
-sudo mkdir -p \$DEM_DIR
-sudo chmod a+w \$DEM_DIR
-
-# フラグファイルの設定
-FLAG_FILE="\$DEM_DIR/.tiff_files_downloaded"
-
-# gs://obp-dem/*.tif ファイルのコピー（フラグファイルが存在しない場合のみ）
-if [ ! -f "\$FLAG_FILE" ]; then
-    echo "Copying .tif files from gs://obp-dem/ to \$DEM_DIR"
-    gsutil -m cp gs://obp-dem/*.tif \$DEM_DIR/
-    if [ \$? -eq 0 ]; then
-        echo "Copy completed successfully."
-        # フラグファイルの作成
-        touch \$FLAG_FILE
-    else
-        echo "Error occurred during file copy."
-    fi
-else
-    echo "Tiff files have already been downloaded. Skipping download."
-fi
-
 echo "Startup script completed at $(date)"
 EOF
 
-# VMインスタンスの作成
+log $LOG_LEVEL_INFO "Creating VM instance"
+# インスタンスの作成
 gcloud compute instances create $INSTANCE_NAME \
-    --project=$OBP_PROJECT_ID \
-    --zone=${REGION}-b \
+    --project=$PROJECT_ID \
+    --zone=$ZONE \
     --machine-type=$MACHINE_TYPE \
-    --network-interface=network=$OBP_VPC_NAME,subnet=$OBP_SUBNET_NAME \
+    --network-interface=network=$VPC_NAME,subnet=$SUBNET_NAME \
     --maintenance-policy=MIGRATE \
     --provisioning-model=STANDARD \
-    --service-account=$OBP_SERVICE_ACCOUNT_EMAIL \
+    --service-account=$SERVICE_ACCOUNT_EMAIL \
     --scopes=https://www.googleapis.com/auth/cloud-platform \
-    --create-disk=auto-delete=yes,boot=yes,device-name=$INSTANCE_NAME,image-project=$UBUNTU_IMAGE_PROJECT,image=$UBUNTU_IMAGE,mode=rw,size=$BOOT_DISK_SIZE,type=pd-balanced \
+    --create-disk=auto-delete=yes,boot=yes,device-name=$INSTANCE_NAME,image=projects/ubuntu-os-cloud/global/images/ubuntu-2004-focal-v20240808,mode=rw,size=$BOOT_DISK_SIZE,type=pd-balanced \
     --create-disk=auto-delete=yes,device-name=$INSTANCE_NAME-data,mode=rw,size=$DATA_DISK_SIZE,type=pd-balanced \
     --no-shielded-secure-boot \
     --shielded-vtpm \
     --shielded-integrity-monitoring \
-    --labels=ec-src=vm_add-gcloud \
     --reservation-affinity=any \
-    --metadata-from-file=startup-script=startup-script.sh \
-    --metadata=serial-port-enable=true
+    --metadata-from-file=startup-script=startup-script.sh
 
-echo "VMインスタンス $INSTANCE_NAME が作成されました。SSHの準備を待っています..."
+log $LOG_LEVEL_INFO "VM instance $INSTANCE_NAME created. Waiting for SSH to be ready..."
 
-# インスタンスが完全に起動し、SSHが利用可能になるまで待機
-while ! gcloud compute ssh $INSTANCE_NAME --zone=${REGION}-b --command="echo SSH is ready" &>/dev/null; do
-  echo "SSHの準備中..."
-  sleep 10
+# SSHが利用可能になるまで待機
+MAX_RETRIES=20
+RETRY_INTERVAL=30
+for i in $(seq 1 $MAX_RETRIES); do
+    if gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --command="echo SSH is ready" --quiet; then
+        log $LOG_LEVEL_INFO "SSH is now available for $INSTANCE_NAME."
+        break
+    else
+        log $LOG_LEVEL_INFO "Waiting for SSH to become available... Attempt $i of $MAX_RETRIES"
+        if [ $i -eq $MAX_RETRIES ]; then
+            log $LOG_LEVEL_ERROR "Timed out waiting for SSH to become available."
+            exit 1
+        fi
+        sleep $RETRY_INTERVAL
+    fi
 done
-echo "SSHが利用可能になりました。"
 
 # サービスアカウントキーファイルの転送
-echo "サービスアカウントキーファイルを転送しています..."
-gcloud compute scp $SA_KEY_FILE $INSTANCE_NAME:~/obp-deployment-sa-key.json --zone=${REGION}-b
+log $LOG_LEVEL_INFO "Transferring service account key file..."
+gcloud compute scp $SA_KEY_FILE $INSTANCE_NAME:~/sa-key.json --zone=$ZONE
 
 # キーファイルの権限を設定
-gcloud compute ssh $INSTANCE_NAME --zone=${REGION}-b --command="chmod 600 ~/obp-deployment-sa-key.json"
+gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --command="chmod 600 ~/sa-key.json"
 
-echo "サービスアカウントキーファイルが転送され、権限が設定されました。"
+log $LOG_LEVEL_INFO "Service account key file transferred and permissions set."
 
 # 起動スクリプトの完了を待つ
-echo "起動スクリプトの完了を待っています..."
-while true; do
-    output=$(gcloud compute instances get-serial-port-output $INSTANCE_NAME --zone=${REGION}-b --project=$OBP_PROJECT_ID 2>&1)
-    if echo "$output" | grep -q "Startup script completed"; then
-        echo "起動スクリプトが完了しました。"
-        break
-    elif echo "$output" | grep -q "Error occurred during file copy"; then
-        echo "ファイルのコピー中にエラーが発生しました。"
+log $LOG_LEVEL_INFO "Waiting for startup script to complete..."
+MAX_STARTUP_WAIT=1200  # 20分
+STARTUP_CHECK_INTERVAL=60  # 1分ごとにチェック
+startup_wait_time=0
+
+while [ $startup_wait_time -lt $MAX_STARTUP_WAIT ]; do
+    startup_status=$(gcloud compute instances get-serial-port-output $INSTANCE_NAME --zone=$ZONE --project=$PROJECT_ID | grep "Startup script completed")
+    if [[ ! -z "$startup_status" ]]; then
+        log $LOG_LEVEL_INFO "Startup script completed successfully."
         break
     fi
-    sleep 10
+    log $LOG_LEVEL_INFO "Startup script still running. Waiting..."
+    sleep $STARTUP_CHECK_INTERVAL
+    startup_wait_time=$((startup_wait_time + STARTUP_CHECK_INTERVAL))
 done
 
-echo "VMインスタンス $INSTANCE_NAME のセットアップが完了しました。"
-echo "注意: Dockerをsudoなしで使用するには、インスタンスにSSH接続後に 'newgrp docker' コマンドを実行するか、一度ログアウトして再度ログインしてください。"
+if [ $startup_wait_time -ge $MAX_STARTUP_WAIT ]; then
+    log $LOG_LEVEL_ERROR "Startup script did not complete within the expected time. Please check the instance logs."
+    exit 1
+fi
+
+log $LOG_LEVEL_INFO "VM instance $INSTANCE_NAME setup completed."
+log $LOG_LEVEL_INFO "Note: To use Docker without sudo, SSH into the instance and run 'newgrp docker' or log out and log back in."

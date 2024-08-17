@@ -1,10 +1,15 @@
 #!/bin/bash
 
 # エラーが発生した場合にスクリプトを終了
-set -e
+set -euo pipefail
+
+# ユーティリティスクリプトの読み込み
+source ./utils.sh
 
 # デフォルト値の設定
 DEFAULT_REGION="asia-northeast1"
+PROJECT_ID=$(gcloud config get-value project)
+INSTANCE_NAME="obp-master-vm"
 
 # 変数の初期化
 REGION=$DEFAULT_REGION
@@ -16,34 +21,46 @@ while [[ $# -gt 0 ]]; do
       REGION="${1#*=}"
       shift
       ;;
+    --project-id=*)
+      PROJECT_ID="${1#*=}"
+      shift
+      ;;
     *)
-      echo "エラー: 不明な引数 $1"
-      echo "使用方法: $0 [--region=REGION]"
-      exit 1
+      handle_error 1 "Unknown argument: $1"
       ;;
   esac
 done
 
-# VMインスタンス名を設定
-INSTANCE_NAME="obp-master-vm"
+log $LOG_LEVEL_INFO "Region: $REGION"
+log $LOG_LEVEL_INFO "Project ID: $PROJECT_ID"
 
 # インスタンスの存在確認
-INSTANCE_EXISTS=$(gcloud compute instances list --filter="name=$INSTANCE_NAME" --format="value(name)")
-
-if [ -z "$INSTANCE_EXISTS" ]; then
-  echo "インスタンス $INSTANCE_NAME が存在しません。"
-else
-  # インスタンスの状態を確認
-  INSTANCE_STATUS=$(gcloud compute instances describe $INSTANCE_NAME --zone=${REGION}-b --format="value(status)")
-  
-  if [ "$INSTANCE_STATUS" = "RUNNING" ]; then
-    echo "インスタンス $INSTANCE_NAME を停止します。"
-    gcloud compute instances stop $INSTANCE_NAME --zone=${REGION}-b
-  elif [ "$INSTANCE_STATUS" = "TERMINATED" ]; then
-    echo "インスタンス $INSTANCE_NAME は既に停止しています。"
-  else
-    echo "インスタンス $INSTANCE_NAME の状態: $INSTANCE_STATUS"
-  fi
+if ! check_resource_exists "compute instances" "$INSTANCE_NAME" "$PROJECT_ID" "--filter=name=$INSTANCE_NAME"; then
+  handle_error 1 "Instance $INSTANCE_NAME does not exist."
 fi
 
-echo "インスタンス $INSTANCE_NAME の操作が完了しました。"
+# インスタンスのゾーンを取得
+ZONE=$(gcloud compute instances list --filter="name=$INSTANCE_NAME" --project=$PROJECT_ID --format="value(zone)")
+if [ -z "$ZONE" ]; then
+  handle_error 1 "Failed to get zone for instance $INSTANCE_NAME."
+fi
+
+log $LOG_LEVEL_INFO "Instance $INSTANCE_NAME zone: $ZONE"
+
+# インスタンスの状態を確認
+INSTANCE_STATUS=$(gcloud compute instances describe $INSTANCE_NAME --zone=$ZONE --project=$PROJECT_ID --format="value(status)")
+
+if [ "$INSTANCE_STATUS" = "RUNNING" ]; then
+  log $LOG_LEVEL_INFO "Stopping instance $INSTANCE_NAME."
+  if gcloud compute instances stop $INSTANCE_NAME --zone=$ZONE --project=$PROJECT_ID; then
+    log $LOG_LEVEL_INFO "Instance $INSTANCE_NAME stopped successfully."
+  else
+    handle_error 1 "Failed to stop instance $INSTANCE_NAME."
+  fi
+elif [ "$INSTANCE_STATUS" = "TERMINATED" ]; then
+  log $LOG_LEVEL_INFO "Instance $INSTANCE_NAME is already stopped."
+else
+  handle_error 1 "Instance $INSTANCE_NAME is in an unexpected state: $INSTANCE_STATUS"
+fi
+
+log $LOG_LEVEL_INFO "Operation on instance $INSTANCE_NAME completed."

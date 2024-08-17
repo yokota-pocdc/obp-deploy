@@ -1,30 +1,49 @@
 #!/bin/bash
 
 # エラーが発生した場合にスクリプトを終了
-set -e
+set -euo pipefail
 
-# プロジェクトIDの設定
-PROJECT_ID=$(gcloud config get-value project)
-if [ -z "$PROJECT_ID" ]; then
-    echo "プロジェクトIDが設定されていません。"
-    exit 1
-fi
+# ユーティリティスクリプトの読み込み
+source ./utils.sh
 
-echo "現在のプロジェクト: $PROJECT_ID"
+# デフォルト値の設定
+PROJECT_ID=""
+REGION=""
+
+# 引数の処理
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --project-id=*)
+      PROJECT_ID="${1#*=}"
+      shift
+      ;;
+    --region=*)
+      REGION="${1#*=}"
+      shift
+      ;;
+    *)
+      handle_error 1 "Unknown argument: $1"
+      ;;
+  esac
+done
+
+# 必須パラメータの確認
+validate_env_vars "PROJECT_ID" "REGION"
+
+log $LOG_LEVEL_INFO "Project ID: $PROJECT_ID"
+log $LOG_LEVEL_INFO "Region: $REGION"
 
 # Secret Manager APIの有効化
-echo "Secret Manager APIを有効化しています..."
-gcloud services enable secretmanager.googleapis.com
+log $LOG_LEVEL_INFO "Enabling Secret Manager API..."
+enable_api "secretmanager.googleapis.com" "$PROJECT_ID"
 
 # APIが有効化されたことを確認
-echo "Secret Manager APIが有効化されていることを確認しています..."
-API_ENABLED=$(gcloud services list --enabled --format="value(NAME)" | grep secretmanager.googleapis.com || true)
+log $LOG_LEVEL_INFO "Verifying Secret Manager API is enabled..."
+API_ENABLED=$(gcloud services list --enabled --format="value(NAME)" --project=$PROJECT_ID | grep secretmanager.googleapis.com || true)
 if [ -z "$API_ENABLED" ]; then
-    echo "Secret Manager APIの有効化に失敗しました。"
-    exit 1
+    handle_error 1 "Failed to enable Secret Manager API."
 fi
-
-echo "Secret Manager APIが正常に有効化されました。"
+log $LOG_LEVEL_INFO "Secret Manager API successfully enabled."
 
 # シークレット名とJSONファイル名の設定
 SECRET_NAME="add3-credential"
@@ -32,21 +51,25 @@ JSON_FILE="add3_credential.json"
 
 # JSONファイルの存在確認
 if [ ! -f "$JSON_FILE" ]; then
-    echo "エラー: $JSON_FILE が見つかりません。"
-    exit 1
+    handle_error 1 "$JSON_FILE not found."
 fi
 
 # シークレットの存在確認
-if gcloud secrets describe $SECRET_NAME &>/dev/null; then
-    echo "シークレット '$SECRET_NAME' は既に存在します。新しいバージョンを追加します。"
+if check_resource_exists "secrets" "$SECRET_NAME" "$PROJECT_ID"; then
+    log $LOG_LEVEL_INFO "Secret '$SECRET_NAME' already exists. Adding a new version."
     # 新しいバージョンを追加
-    gcloud secrets versions add $SECRET_NAME --data-file="$JSON_FILE"
-    echo "シークレット '$SECRET_NAME' に新しいバージョンが追加されました。"
+    gcloud secrets versions add $SECRET_NAME --data-file="$JSON_FILE" --project=$PROJECT_ID
+    log $LOG_LEVEL_INFO "New version added to secret '$SECRET_NAME'."
 else
-    echo "シークレット '$SECRET_NAME' を新規作成しています..."
+    log $LOG_LEVEL_INFO "Creating new secret '$SECRET_NAME'..."
     # シークレットの作成と初期値の設定
-    gcloud secrets create $SECRET_NAME --replication-policy="automatic" --data-file="$JSON_FILE"
-    echo "シークレット '$SECRET_NAME' が作成され、初期値が設定されました。"
+    gcloud secrets create $SECRET_NAME --replication-policy="automatic" --data-file="$JSON_FILE" --project=$PROJECT_ID
+    log $LOG_LEVEL_INFO "Secret '$SECRET_NAME' created and initial value set."
 fi
 
-echo "セットアップが完了しました。"
+log $LOG_LEVEL_INFO "Credential setup completed successfully."
+
+# JSONファイルのクリーンアップ
+log $LOG_LEVEL_INFO "Cleaning up sensitive files..."
+shred -u "$JSON_FILE"
+log $LOG_LEVEL_INFO "Sensitive files cleaned up."

@@ -1,11 +1,19 @@
 #!/bin/bash
 
 # エラーが発生した場合にスクリプトを終了
-set -e
+set -euo pipefail
+
+# ユーティリティスクリプトの読み込み
+source ./utils.sh
 
 # デフォルト値の設定
-DEFAULT_REGION="asia-northeast1"
+DEFAULT_REGION="us-central1"
 DEFAULT_MACHINE_TYPE="e2-medium"
+PROJECT_ID=$(gcloud config get-value project)
+VPC_NAME="obp-vpc-${PROJECT_ID}"
+SUBNET_NAME="obp-subnet"
+SERVICE_ACCOUNT_NAME="obp-deployment-sa"
+SERVICE_ACCOUNT_EMAIL="${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
 # 引数の解析
 REGION=$DEFAULT_REGION
@@ -23,31 +31,50 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     *)
-      echo "エラー: 不明な引数 $1"
-      echo "使用方法: $0 [--region=REGION] [--machine-type=MACHINE_TYPE]"
-      exit 1
+      handle_error 1 "Unknown argument: $1"
       ;;
   esac
 done
 
-echo "使用するリージョン: $REGION"
-echo "使用するマシンタイプ: $MACHINE_TYPE"
+# 環境変数の検証
+validate_env_vars "PROJECT_ID" "VPC_NAME" "SUBNET_NAME" "SERVICE_ACCOUNT_NAME" "SERVICE_ACCOUNT_EMAIL"
 
-# create_sa.shの実行
-#/bin/bash create_sa.sh "$REGION"
+log $LOG_LEVEL_INFO "Starting setup for project: $PROJECT_ID"
+log $LOG_LEVEL_INFO "VPC name: $VPC_NAME"
+log $LOG_LEVEL_INFO "Subnet name: $SUBNET_NAME"
+log $LOG_LEVEL_INFO "Region: $REGION"
+log $LOG_LEVEL_INFO "Machine type: $MACHINE_TYPE"
+log $LOG_LEVEL_INFO "Service account name: $SERVICE_ACCOUNT_NAME"
+log $LOG_LEVEL_INFO "Service account email: $SERVICE_ACCOUNT_EMAIL"
 
-# create_nw.shの実行
-/bin/bash create_nw.sh "$REGION"
+# 必要なAPIを有効化
+apis=(
+  "compute.googleapis.com"
+  "iam.googleapis.com"
+  "cloudresourcemanager.googleapis.com"
+  "artifactregistry.googleapis.com"
+  "bigquery.googleapis.com"
+  "bigquerydatatransfer.googleapis.com"
+  "serviceusage.googleapis.com"
+)
 
-# credential.shの実行
-/bin/bash credential.sh "$REGION"
+for api in "${apis[@]}"; do
+  enable_api $api $PROJECT_ID
+done
 
-/bin/bash create_geoid.sh
+# サブスクリプトの実行
+log $LOG_LEVEL_INFO "Creating service account"
+./create_sa.sh --project-id="$PROJECT_ID" --region="$REGION" --service-account-name="$SERVICE_ACCOUNT_NAME"
 
-# download_dem.shの実行（リージョンパラメータを渡す）
-# /bin/bash download_dem.sh "$REGION"
+log $LOG_LEVEL_INFO "Creating network"
+./create_nw.sh --project-id="$PROJECT_ID" --vpc-name="$VPC_NAME" --subnet-name="$SUBNET_NAME" --region="$REGION"
 
-# start_vm_instance.shの実行（リージョンとマシンタイプパラメータを名前付き引数として渡す）
-/bin/bash start_vm_instance.sh --region="$REGION" --machine-type="$MACHINE_TYPE"
+log $LOG_LEVEL_INFO "Setting up credentials"
+./credential.sh --project-id="$PROJECT_ID" --region="$REGION"
 
-echo "セットアップが完了しました。リージョン: $REGION、マシンタイプ: $MACHINE_TYPE"
+log $LOG_LEVEL_INFO "Starting VM instance"
+./start_vm_instance.sh --project-id="$PROJECT_ID" --vpc-name="$VPC_NAME" --subnet-name="$SUBNET_NAME" --region="$REGION" --machine-type="$MACHINE_TYPE" --service-account-email="$SERVICE_ACCOUNT_EMAIL"
+
+log $LOG_LEVEL_INFO "Setup completed successfully"
+log $LOG_LEVEL_INFO "Project: $PROJECT_ID, VPC: $VPC_NAME, Subnet: $SUBNET_NAME, Region: $REGION, Machine type: $MACHINE_TYPE, Service account: $SERVICE_ACCOUNT_EMAIL"
+
