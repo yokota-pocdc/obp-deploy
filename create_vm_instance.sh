@@ -122,6 +122,9 @@ if ! command -v docker &> /dev/null; then
     "data-root": "\$MOUNT_POINT/docker"
 }
 EOT
+    sudo systemctl stop docker
+    sudo systemctl stop docker.socket
+    sudo systemctl daemon-reload
     sudo systemctl start docker
     sudo systemctl enable docker
     sudo usermod -aG docker \$USER
