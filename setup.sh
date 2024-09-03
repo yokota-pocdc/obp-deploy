@@ -56,7 +56,9 @@ apis=(
   "bigquery.googleapis.com"
   "bigquerydatatransfer.googleapis.com"
   "serviceusage.googleapis.com"
+  "storage-api.googleapis.com"
   "dataflow.googleapis.com"
+  "secretmanager.googleapis.com"
   "cloudbuild.googleapis.com"
 )
 
@@ -69,13 +71,13 @@ log $LOG_LEVEL_INFO "Creating service account"
 ./create_sa.sh --project-id="$PROJECT_ID" --region="$REGION" --service-account-name="$SERVICE_ACCOUNT_NAME"
 
 log $LOG_LEVEL_INFO "Creating network"
-#./create_nw.sh --project-id="$PROJECT_ID" --vpc-name="$VPC_NAME" --subnet-name="$SUBNET_NAME" --region="$REGION"
+./create_nw.sh --project-id="$PROJECT_ID" --vpc-name="$VPC_NAME" --subnet-name="$SUBNET_NAME" --region="$REGION"
 
 log $LOG_LEVEL_INFO "Setting up credentials"
-#./credential.sh --project-id="$PROJECT_ID" --region="$REGION"
+./credential.sh --project-id="$PROJECT_ID" --region="$REGION"
 
 log $LOG_LEVEL_INFO "Starting VM instance"
-#./start_vm_instance.sh --project-id="$PROJECT_ID" --vpc-name="$VPC_NAME" --subnet-name="$SUBNET_NAME" --region="$REGION" --machine-type="$MACHINE_TYPE" --service-account-email="$SERVICE_ACCOUNT_EMAIL"
+./start_vm_instance.sh --project-id="$PROJECT_ID" --vpc-name="$VPC_NAME" --subnet-name="$SUBNET_NAME" --region="$REGION" --machine-type="$MACHINE_TYPE" --service-account-email="$SERVICE_ACCOUNT_EMAIL"
 
 log $LOG_LEVEL_INFO "Setup completed successfully"
 log $LOG_LEVEL_INFO "Project: $PROJECT_ID, VPC: $VPC_NAME, Subnet: $SUBNET_NAME, Region: $REGION, Machine type: $MACHINE_TYPE, Service account: $SERVICE_ACCOUNT_EMAIL"

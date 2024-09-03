@@ -44,6 +44,9 @@ SERVICE_ACCOUNT_DISPLAY_NAME="OBP Deployment Service Account"
 SERVICE_ACCOUNT_EMAIL="${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 log $LOG_LEVEL_INFO "Creating or updating service account: $SERVICE_ACCOUNT_EMAIL"
 
+# プロジェクト番号の取得
+PROJECT_NUMBER=$(gcloud projects describe $PROJECT_ID --format="value(projectNumber)")
+
 # サービスアカウントの存在確認
 if check_resource_exists "iam service-accounts" "$SERVICE_ACCOUNT_EMAIL" "$PROJECT_ID"; then
     log $LOG_LEVEL_INFO "Service account $SERVICE_ACCOUNT_EMAIL already exists."
@@ -71,16 +74,17 @@ else
 	    "roles/containerregistry.ServiceAgent"
 	    "roles/dataflow.developer"
 	    "roles/dataflow.worker"
-	    "roles/dataflow.admin"  # Dataflow管理者権限を追加
+	    "roles/dataflow.admin"
 	    "roles/storage.admin"
 	    "roles/storage.objectViewer"
 	    "roles/storage.objectAdmin"
 	    "roles/storage.objectCreator"
 	    "roles/iam.serviceAccountUser"
-	    "roles/iam.serviceAccountTokenCreator"  # サービスアカウントトークン作成権限を追加
+	    "roles/iam.serviceAccountTokenCreator"
 	    "roles/serviceusage.serviceUsageAdmin"
-            "roles/cloudbuild.builds.viewer"
+      "roles/cloudbuild.builds.viewer"
 	    "roles/serviceusage.serviceUsageConsumer"
+      "roles/secretmanager.secretAccessor"
     )
     for role in "${roles[@]}"
     do
@@ -92,6 +96,17 @@ else
             log $LOG_LEVEL_DEBUG "Role $role has been granted."
         fi
     done
+fi
+
+# BigQuery Data Transfer Serviceにトークン作成者の権限を付与
+BQ_TRANSFER_SA="service-${PROJECT_NUMBER}@gcp-sa-bigquerydatatransfer.iam.gserviceaccount.com"
+log $LOG_LEVEL_INFO "Granting token creator role to BigQuery Data Transfer Service."
+if ! gcloud iam service-accounts add-iam-policy-binding $SERVICE_ACCOUNT_EMAIL \
+    --member="serviceAccount:$BQ_TRANSFER_SA" \
+    --role="roles/iam.serviceAccountTokenCreator"; then
+    log $LOG_LEVEL_WARN "Failed to add token creator role to BigQuery Data Transfer Service."
+else
+    log $LOG_LEVEL_DEBUG "Token creator role has been granted to BigQuery Data Transfer Service."
 fi
 
 # サービスアカウントキーの生成と保存
